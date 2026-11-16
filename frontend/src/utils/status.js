@@ -21,3 +21,22 @@ export function entityTypeText(t) {
     EQUIPMENT: '设备序列号', SUPPLIER: '供应商编码'
   }[t] || t
 }
+// 维修通知资格四档 + 待核
+export function qualText(q) {
+  return {
+    CERTAIN: '必然安装', POSSIBLE: '可能安装', INSUFFICIENT: '证据不足',
+    EXCLUDED: '可排除', PENDING_REVIEW: '矛盾待核'
+  }[q] || q
+}
+export function qualType(q) {
+  return {
+    CERTAIN: 'success', POSSIBLE: 'warning', INSUFFICIENT: 'info',
+    EXCLUDED: '', PENDING_REVIEW: 'danger'
+  }[q] || 'info'
+}
+export function evidenceNodeText(t) {
+  return {
+    INSTALL_SIGN: '安装签字', REMOVE_SIGN: '拆除签字', INVENTORY_COUNT: '盘点凭证',
+    FACTORY_RECORD: '出厂记录', ASSEMBLY_TRANSFER: '总成转装', REPAIR_ORDER: '维修单', RULE_CLAIM: '规则主张'
+  }[t] || t
+}

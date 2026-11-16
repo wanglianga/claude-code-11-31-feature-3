@@ -46,7 +46,10 @@ const scenarios = [
     route: '/impact' },
   { title: 'E. 两条约束联动', tag: '最小证据链', type: 'success',
     desc: '电源 380V + 协议 EtherCAT（或 + 尺寸 2U）同时满足才 PASS；502 因尺寸 3U≠2U 判 FAIL，逐项约束进入证据链。',
-    route: '/compatibility' }
+    route: '/compatibility' },
+  { title: 'F~I. 维修通知资格论证', tag: '四档资格+证据论证图', type: 'primary',
+    desc: '供应商维修通知按目标窗实际安装证据定档：必然/可能/证据不足/可排除，矛盾只能待核；总成转装不复制内部件，迟到凭证只产生补充名单。',
+    route: '/maintenance-notice' }
 ]
 
 onMounted(async () => {

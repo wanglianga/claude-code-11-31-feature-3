@@ -119,6 +119,90 @@ st, r = call("POST", f"/entities/conflicts/{cid}/adjudicate", token,
              {"resolutionNote": "E2E 核验裁定：以现场签收凭证为准", "keepFirstVoucher": True})
 check("凭证裁定闭环", st == 200 and r["data"]["resolution_status"] == "ADJUDICATED")
 
+# =====================================================================
+# 维修通知资格论证（四类验收 + 迟到补充名单 + 总成不复制）
+# =====================================================================
+_, r = call("GET", "/maintenance/notices", token)
+notices = {n["notice_code"]: n for n in r["data"]}
+check("维修通知清单含 5 条通知", len(notices) == 5, str(sorted(notices)))
+
+def run_detail(notice_id):
+    _, rr = call("GET", f"/maintenance/notices/{notice_id}/runs", token)
+    run_ids = [x["id"] for x in rr["data"]]
+    out = {}
+    for rid in run_ids:
+        _, d = call("GET", f"/maintenance/runs/{rid}", token)
+        d = d["data"]
+        for el in d["eligibilities"]:
+            out[(rid, el["equipment_code"])] = el
+    return rr["data"], out
+
+# 场景 F：拆装时间缺口 + 迟到凭证只产生补充名单
+n1_runs, n1 = run_detail(notices["NTC-2025-001"]["id"])
+check("场景F 冷却器通知有 2 个评估批次（认知边界 + 全量）", len(n1_runs) == 2)
+r1, r2 = n1_runs[0]["id"], n1_runs[1]["id"]
+check("场景F 首次评估（迟到装回未纳入）EQ0101 可排除",
+      n1[(r1, "EQ-CNC-2025-0101")]["qualification"] == "EXCLUDED")
+check("场景F 二次评估（迟到凭证纳入）EQ0101 必然安装，且首次批次保留不改写",
+      n1[(r2, "EQ-CNC-2025-0101")]["qualification"] == "CERTAIN"
+      and n1[(r1, "EQ-CNC-2025-0101")]["qualification"] == "EXCLUDED")
+check("场景F 必然资格附最小支持材料（装回签字凭证）",
+      any(e.get("sourceRef") == "VCH-LATE-20250315"
+          for e in n1[(r2, "EQ-CNC-2025-0101")]["minimal_evidence"]))
+# 窗内已拆除未复装的设备保持可排除（边界清晰）
+check("场景F EQ0106 冷却器窗前已拆 -> 可排除",
+      n1[(r2, "EQ-CNC-2025-0106")]["qualification"] == "EXCLUDED")
+
+# 场景 G：相反盘点矛盾待核 + 独立缺席盘点可排除
+_, n2 = run_detail(notices["NTC-2025-002"]["id"])
+g_run = list({k[0] for k in n2})[0]
+review = n2[(g_run, "EQ-CNC-2025-0102")]
+check("场景G 在装签字与盘到空位矛盾 -> 待核",
+      review["qualification"] == "PENDING_REVIEW" and len(review["contradiction"]) >= 1)
+excluded = n2[(g_run, "EQ-CNC-2025-0104")]
+check("场景G 两次独立缺席盘点且从无在装主张 -> 可排除",
+      excluded["qualification"] == "EXCLUDED" and len(excluded["minimal_evidence"]) >= 2)
+check("场景G 窗内有在装盘点的液压设备 -> 必然安装",
+      n2[(g_run, "EQ-CNC-2025-0106")]["qualification"] == "CERTAIN")
+
+# 场景 H：嵌套总成转装（父总成 + 内部件随树迁移，内部件不复制为两处）
+_, n3 = run_detail(notices["NTC-2025-003"]["id"])
+h_run = list({k[0] for k in n3})[0]
+check("场景H 齿轮箱总成转装：原设备与目标设备均能按区间定档",
+      n3[(h_run, "EQ-CNC-2025-0103")]["qualification"] == "CERTAIN"
+      and n3[(h_run, "EQ-CNC-2025-0106")]["qualification"] == "CERTAIN")
+_, n4 = run_detail(notices["NTC-2025-004"]["id"])
+b_run = list({k[0] for k in n4})[0]
+bearing_target = n4[(b_run, "EQ-CNC-2025-0106")]
+check("场景H 内部轴承经总成派生 -> 必然安装",
+      bearing_target["qualification"] == "CERTAIN")
+derived = [e for e in bearing_target["minimal_evidence"] if e.get("assemblyDerived")]
+check("场景H 内部件证据带总成派生标记且无独立装拆凭证", len(derived) >= 1)
+# 不复制为两处：同一设备同型号资格只有一行，且最小材料节点编号不重复
+codes = [e["nodeCode"] for e in bearing_target["minimal_evidence"]]
+check("场景H 单设备最小材料节点不重复（内部件未复制为两处）", len(codes) == len(set(codes)))
+
+# 场景 I：缺少拆除单 -> 开放端可能集 -> 可能安装
+_, n5 = run_detail(notices["NTC-2025-005"]["id"])
+i_run = list({k[0] for k in n5})[0]
+possible = n5[(i_run, "EQ-CNC-2025-0104")]
+check("场景I 仅安装签字+在装盘点且无拆除单 -> 可能安装（开放端可能集）",
+      possible["qualification"] == "POSSIBLE"
+      and any(iv.get("openEnd") for iv in possible["possible_intervals"]))
+
+# 即时试算（不落库）返回完整五档计数
+st, r = call("POST", "/maintenance/evaluate-adhoc", token, {
+    "targetModelId": 131,
+    "windowStart": "2025-01-01T00:00:00Z",
+    "windowEnd": "2025-07-01T00:00:00Z"})
+check("即时试算返回五档计数", st == 200 and set(r["data"]["counts"]) ==
+      {"CERTAIN", "POSSIBLE", "INSUFFICIENT", "EXCLUDED", "PENDING_REVIEW"})
+
+# 只读角色不能触发评估（403）
+st, _ = call("POST", f"/maintenance/notices/{notices['NTC-2025-001']['id']}/evaluate",
+             viewer, {})
+check("只读角色维修通知评估拒绝(403)", st == 403, f"http={st}")
+
 print("\n================ 汇总 ================")
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
 if FAIL:

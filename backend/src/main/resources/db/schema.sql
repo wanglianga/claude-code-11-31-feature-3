@@ -333,7 +333,7 @@ CREATE TABLE IF NOT EXISTS quality_event (
     event_type          VARCHAR(32) NOT NULL
                         CHECK (event_type IN
                         ('CONFLICT_BLOCK','ENTITY_FREEZE','RULE_RETIRE','FACT_CORRECTION',
-                         'LATE_VOUCHER','SNAPSHOT_REVIEW','RELEASE_GATE_BLOCK')),
+                         'LATE_VOUCHER','SNAPSHOT_REVIEW','RELEASE_GATE_BLOCK','NOTICE_PENDING_REVIEW')),
     severity            VARCHAR(8) NOT NULL CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
     related_entity_type VARCHAR(32),
     related_entity_id   BIGINT,
@@ -378,3 +378,158 @@ CREATE TABLE IF NOT EXISTS release_audit_log (
     reason              TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------
+-- 12. 维修通知资格论证（供应商维修通知 -> 设备安装证据 -> 通知资格）
+--     资格四档：CERTAIN 必然安装 / POSSIBLE 可能安装 /
+--               INSUFFICIENT 证据不足 / EXCLUDED 可排除
+--     产出的是“通知资格”而非受影响快照；证据相互矛盾只能待核（PENDING_REVIEW）
+-- ---------------------------------------------------------------------
+
+-- 12.1 盘点凭证：只给出“两次盘点之间”的区间证据，不虚构精确装拆时点
+CREATE TABLE IF NOT EXISTS inventory_count (
+    id                  BIGSERIAL PRIMARY KEY,
+    count_code          VARCHAR(64) NOT NULL UNIQUE,              -- 盘点单号
+    equipment_id        BIGINT NOT NULL REFERENCES master_entity(id),
+    mount_position_id   BIGINT REFERENCES master_entity(id),      -- 可空：整设备盘点时不定位到具体位置
+    physical_part_id    BIGINT REFERENCES master_entity(id),      -- 盘到的实物（observed=PRESENT 时必填）
+    part_model_id       BIGINT REFERENCES master_entity(id),
+    observed            VARCHAR(16) NOT NULL
+                        CHECK (observed IN ('PRESENT','ABSENT')), -- 盘到在装 / 盘到空位（相反盘点）
+    count_time          TIMESTAMPTZ NOT NULL,                     -- 盘点时点
+    received_at         TIMESTAMPTZ NOT NULL DEFAULT now(),       -- 平台接收时间（迟到盘点同样只补充不改写）
+    source_contract_id  BIGINT REFERENCES ingestion_contract(id),
+    source_ref          VARCHAR(256),
+    payload_digest      VARCHAR(128),
+    trust_score         NUMERIC(5,2) NOT NULL DEFAULT 60,
+    note                TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_count_equip_time ON inventory_count (equipment_id, count_time);
+CREATE INDEX IF NOT EXISTS idx_count_phys ON inventory_count (physical_part_id);
+
+-- 12.2 总成装配层级：父总成（物理实物）包含子实物，支持嵌套；转装时整树迁移，内部件不复制
+CREATE TABLE IF NOT EXISTS part_assembly_link (
+    id                  BIGSERIAL PRIMARY KEY,
+    parent_physical_id  BIGINT NOT NULL REFERENCES master_entity(id), -- 父总成实物
+    child_physical_id   BIGINT NOT NULL REFERENCES master_entity(id), -- 内部件实物
+    link_type           VARCHAR(16) NOT NULL DEFAULT 'CONTAINS'
+                        CHECK (link_type IN ('CONTAINS')),
+    effective_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    effective_to        TIMESTAMPTZ,
+    source_ref          VARCHAR(256),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (parent_physical_id, child_physical_id)
+);
+CREATE INDEX IF NOT EXISTS idx_assembly_child ON part_assembly_link (child_physical_id);
+
+-- 12.3 维修通知：供应商就某条件（型号/供应商）在目标时间窗发出的维修通知
+CREATE TABLE IF NOT EXISTS maintenance_notice (
+    id                  BIGSERIAL PRIMARY KEY,
+    notice_code         VARCHAR(64) NOT NULL UNIQUE,
+    title               VARCHAR(256) NOT NULL,
+    supplier_id         BIGINT REFERENCES master_entity(id),      -- 发出通知的供应商（可空=按型号条件）
+    target_model_id     BIGINT REFERENCES master_entity(id),      -- 目标部件型号（可空=仅按供应商）
+    window_start        TIMESTAMPTZ NOT NULL,                     -- 目标时间窗起
+    window_end          TIMESTAMPTZ NOT NULL,                     -- 目标时间窗止
+    notice_status       VARCHAR(16) NOT NULL DEFAULT 'OPEN'
+                        CHECK (notice_status IN ('OPEN','CLOSED')),
+    source_ref          VARCHAR(256),
+    payload_digest      VARCHAR(128),
+    created_by          VARCHAR(64),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_notice_window CHECK (window_end > window_start)
+);
+CREATE INDEX IF NOT EXISTS idx_notice_window ON maintenance_notice (window_start, window_end);
+
+-- 12.4 通知资格评估（一次通知可多次评估：迟到凭证只产生补充名单，历史评估保留不改写）
+CREATE TABLE IF NOT EXISTS notice_eligibility_run (
+    id                  BIGSERIAL PRIMARY KEY,
+    notice_id           BIGINT NOT NULL REFERENCES maintenance_notice(id),
+    run_no              VARCHAR(64) NOT NULL UNIQUE,
+    as_of_received      TIMESTAMPTZ,                             -- 认知边界（模拟当时已知凭证）
+    certain_count       INTEGER NOT NULL DEFAULT 0,
+    possible_count      INTEGER NOT NULL DEFAULT 0,
+    insufficient_count  INTEGER NOT NULL DEFAULT 0,
+    excluded_count      INTEGER NOT NULL DEFAULT 0,
+    review_count        INTEGER NOT NULL DEFAULT 0,              -- 矛盾待核数
+    run_digest          VARCHAR(128),                            -- 评估输入指纹
+    created_by          VARCHAR(64),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_elig_run_notice ON notice_eligibility_run (notice_id);
+
+-- 12.5 设备级资格结论（每台设备每个目标型号一行；四档 + 待核）
+CREATE TABLE IF NOT EXISTS notice_eligibility (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_id              BIGINT NOT NULL REFERENCES notice_eligibility_run(id),
+    notice_id           BIGINT NOT NULL REFERENCES maintenance_notice(id),
+    equipment_id        BIGINT NOT NULL REFERENCES master_entity(id),
+    target_model_id     BIGINT REFERENCES master_entity(id),
+    qualification       VARCHAR(20) NOT NULL
+                        CHECK (qualification IN
+                        ('CERTAIN','POSSIBLE','INSUFFICIENT','EXCLUDED','PENDING_REVIEW')),
+    -- 区间求交结果：必要区间 / 可能区间与目标窗的交集（边界清晰，稀疏凭证留下较宽可能集）
+    necessary_intervals JSONB NOT NULL DEFAULT '[]'::jsonb,
+    possible_intervals  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- 最小支持材料：支撑结论的最小凭证集合（维修单/拆装签字/盘点/出厂/总成转装）
+    minimal_evidence    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    contradiction       JSONB NOT NULL DEFAULT '[]'::jsonb,      -- 相互矛盾的证据（只能待核）
+    reasoning           TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (run_id, equipment_id, target_model_id)
+);
+CREATE INDEX IF NOT EXISTS idx_elig_qual ON notice_eligibility (qualification);
+
+-- 12.6 证据论证图节点：维修单 / 拆装签字 / 盘点 / 出厂 / 总成层级
+CREATE TABLE IF NOT EXISTS evidence_node (
+    id                  BIGSERIAL PRIMARY KEY,
+    node_code           VARCHAR(96) NOT NULL UNIQUE,
+    node_type           VARCHAR(24) NOT NULL
+                        CHECK (node_type IN
+                        ('REPAIR_ORDER','INSTALL_SIGN','REMOVE_SIGN','INVENTORY_COUNT',
+                         'FACTORY_RECORD','ASSEMBLY_TRANSFER','RULE_CLAIM')),
+    equipment_id        BIGINT REFERENCES master_entity(id),
+    physical_part_id    BIGINT REFERENCES master_entity(id),
+    part_model_id       BIGINT REFERENCES master_entity(id),
+    mount_position_id   BIGINT REFERENCES master_entity(id),
+    -- 节点断言：该实物在 [claim_from, claim_to] 内安装于该设备（区间断言，精确凭证退化为零长度边界）
+    claim_from          TIMESTAMPTZ,
+    claim_to            TIMESTAMPTZ,
+    certainty           VARCHAR(16) NOT NULL DEFAULT 'NECESSARY'
+                        CHECK (certainty IN ('NECESSARY','POSSIBLE')),
+    source_table        VARCHAR(48),                             -- 凭证来源表
+    source_id           BIGINT,                                  -- 来源行主键
+    source_ref          VARCHAR(256),
+    payload_digest      VARCHAR(128),
+    trust_score         NUMERIC(5,2),
+    received_at         TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_evnode_equip ON evidence_node (equipment_id, part_model_id);
+CREATE INDEX IF NOT EXISTS idx_evnode_phys ON evidence_node (physical_part_id);
+
+-- 12.7 论证边：节点间支持/矛盾/总成派生关系（论证规则可回放）
+CREATE TABLE IF NOT EXISTS evidence_edge (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_id              BIGINT REFERENCES notice_eligibility_run(id),
+    from_node_id        BIGINT NOT NULL REFERENCES evidence_node(id),
+    to_node_id          BIGINT NOT NULL REFERENCES evidence_node(id),
+    edge_type           VARCHAR(20) NOT NULL
+                        CHECK (edge_type IN ('SUPPORTS','CONTRADICTS','DERIVED_ASSEMBLY','BOUNDS')),
+    note                TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (run_id, from_node_id, to_node_id, edge_type)
+);
+
+-- 12.8 独立支持路径：一条设备归属结论必须有至少一条独立支持路径（路径上的凭证可独立支撑结论）
+CREATE TABLE IF NOT EXISTS evidence_support_path (
+    id                  BIGSERIAL PRIMARY KEY,
+    eligibility_id      BIGINT NOT NULL REFERENCES notice_eligibility(id),
+    path_no             VARCHAR(64) NOT NULL,
+    independent         BOOLEAN NOT NULL DEFAULT TRUE,
+    node_codes          VARCHAR(96)[] NOT NULL DEFAULT '{}',     -- 有序节点编号
+    path_summary        TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_support_elig ON evidence_support_path (eligibility_id);

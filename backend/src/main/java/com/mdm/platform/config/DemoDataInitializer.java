@@ -6,6 +6,7 @@ import com.mdm.platform.service.ImpactAnalysisService;
 import com.mdm.platform.service.IngestionService;
 import com.mdm.platform.service.ReleaseGateService;
 import com.mdm.platform.service.SnapshotService;
+import com.mdm.platform.service.notice.MaintenanceNotificationService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -39,6 +40,7 @@ public class DemoDataInitializer implements ApplicationRunner {
     private final ReleaseGateService releaseGateService;
     private final IngestionService ingestionService;
     private final ImpactAnalysisService impactAnalysisService;
+    private final MaintenanceNotificationService maintenanceNotificationService;
 
     @Value("${app.demo.auto-init:true}")
     private boolean autoInit;
@@ -51,7 +53,8 @@ public class DemoDataInitializer implements ApplicationRunner {
                                CompatibilityService compatibilityService,
                                ReleaseGateService releaseGateService,
                                IngestionService ingestionService,
-                               ImpactAnalysisService impactAnalysisService) {
+                               ImpactAnalysisService impactAnalysisService,
+                               MaintenanceNotificationService maintenanceNotificationService) {
         this.dataSource = dataSource;
         this.db = db;
         this.snapshotService = snapshotService;
@@ -59,6 +62,7 @@ public class DemoDataInitializer implements ApplicationRunner {
         this.releaseGateService = releaseGateService;
         this.ingestionService = ingestionService;
         this.impactAnalysisService = impactAnalysisService;
+        this.maintenanceNotificationService = maintenanceNotificationService;
     }
 
     @Override
@@ -89,7 +93,9 @@ public class DemoDataInitializer implements ApplicationRunner {
     }
 
     private void truncateAll(Connection conn) throws Exception {
-        String[] tables = {"release_audit_log","impact_analysis","quality_event","compatibility_fact",
+        String[] tables = {"evidence_support_path","evidence_edge","evidence_node","notice_eligibility",
+                "notice_eligibility_run","maintenance_notice","inventory_count","part_assembly_link",
+                "release_audit_log","impact_analysis","quality_event","compatibility_fact",
                 "conflict_fact","snapshot_position","config_snapshot","rule_constraint","substitution_rule",
                 "inspection_record","factory_record","install_event","drawing_revision","drawing",
                 "entity_alias_candidate","master_entity","ingestion_contract_version","ingestion_contract",
@@ -194,9 +200,45 @@ public class DemoDataInitializer implements ApplicationRunner {
         // 图号修订影响分析（场景A 配套）
         impactAnalysisService.analyzeDrawingChange(2L);
 
+        // ---------- 维修通知资格论证：四类验收场景 ----------
+        replayNoticeEligibility();
+
         log.info("==== 五大场景重放完成，共生成快照 {} 个，兼容事实 {} 条，质量事件 {} 条 ====",
                 db.count("SELECT count(*) FROM config_snapshot"),
                 db.count("SELECT count(*) FROM compatibility_fact"),
                 db.count("SELECT count(*) FROM quality_event"));
+    }
+
+    /**
+     * 维修通知资格重放：
+     *  F 拆装时间缺口 / G 相反盘点+独立缺席盘点 / H 嵌套总成转装 / I 缺少拆除单
+     *  另对 NTC-2025-001 做两次评估，验证迟到装拆凭证只产生补充名单、首次评估保留不改写。
+     */
+    private void replayNoticeEligibility() {
+        // 通知 1：冷却器 300（型号 130）——含场景 F 与迟到凭证补充名单
+        // 第一次评估：认知边界 2025-04-01，2025-05 才接收的装回凭证(EV-INST-101)尚不可见
+        var firstRun = maintenanceNotificationService.evaluateNotice(1L,
+                OffsetDateTime.parse("2025-04-01T00:00:00Z"));
+        log.info("场景F-1: 冷却器通知首次评估（迟到装回凭证未纳入），run={}",
+                ((java.util.Map<?, ?>) firstRun.get("run")).get("run_no"));
+        // 第二次评估：纳入全部已知凭证 -> EQ0101 由可排除补充进必然名单，首次 run 保留
+        var secondRun = maintenanceNotificationService.evaluateNotice(1L, null);
+        log.info("场景F-2: 迟到凭证纳入后二次评估，仅新增补充 run，历史 run 不改写");
+
+        // 通知 2：液压阀组 400（型号 131）——场景 G 矛盾待核 + 独立缺席盘点可排除
+        maintenanceNotificationService.evaluateNotice(2L, null);
+        // 通知 3：齿轮箱总成 500（型号 132）——场景 H 父总成转装
+        maintenanceNotificationService.evaluateNotice(3L, null);
+        // 通知 4：总成内轴承 600（型号 133）——场景 H 内部件随总成派生，不复制为两处
+        maintenanceNotificationService.evaluateNotice(4L, null);
+        // 通知 5：辅助驱动器 700（型号 134）——场景 I 缺少拆除单，开放端可能集
+        maintenanceNotificationService.evaluateNotice(5L, null);
+
+        log.info("维修通知资格重放完成：通知 {} 条，评估 run {} 个，资格结论 {} 条，论证节点 {} 个，支持路径 {} 条",
+                db.count("SELECT count(*) FROM maintenance_notice"),
+                db.count("SELECT count(*) FROM notice_eligibility_run"),
+                db.count("SELECT count(*) FROM notice_eligibility"),
+                db.count("SELECT count(*) FROM evidence_node"),
+                db.count("SELECT count(*) FROM evidence_support_path"));
     }
 }

@@ -21,6 +21,7 @@
 | 兼容事实求值器 | 对给定快照输出 **通过 / 不通过 / 证据不足** 及**最小证据链** |
 | 影响分析器 | 规则、图号、实装记录变更后定位受影响快照、历史结论与下游数据集 |
 | 发布闸门 | 草稿 / 已验证 / 待复核 / 已废止分通道对外，冲突未裁定或非 PASS 结论禁止发布 |
+| 维修通知资格论证器 | 对供应商条件+目标时间窗，按实际安装证据输出**必然安装/可能安装/证据不足/可排除（矛盾只能待核）**设备集合与最小支持材料；区间求交+证据论证图双方法，嵌套总成转装不复制内部件，迟到凭证只产生补充名单 |
 
 ### 明确不做的事（外部业务系统职责）
 不生成**领料单、维修工序、库存调拨、采购决策、工位排程**。平台只产出可回放的事实与证据。
@@ -44,17 +45,18 @@
 │       ├── resources/
 │       │   ├── application.yml
 │       │   └── db/schema.sql   # 全部表结构
-│       │       db/seed.sql     # 五大场景基础主数据
+│       │       db/seed.sql     # 五大场景 + 维修通知四类验收基础主数据
 │       └── java/com/mdm/platform/
 │           ├── config/         # 初始化器、Jackson/PG 序列化
 │           ├── security/       # 令牌认证、角色拦截
 │           ├── repository/     # JdbcSupport
-│           ├── service/        # 七大模块核心逻辑
+│           ├── service/        # 核心模块逻辑
+│           │   └── notice/     # 维修通知资格：区间引擎、证据论证图、资格服务
 │           └── web/            # REST 控制器
 └── frontend/                   # Vue3 工程
     ├── Dockerfile
     ├── nginx.conf
-    └── src/views/              # 10 个业务页面
+    └── src/views/              # 11 个业务页面（含“维修通知资格论证”）
 ```
 
 ---
@@ -148,7 +150,55 @@ POST /api/compatibility/evaluate | GET /api/compatibility/facts-all
 POST /api/facts/{id}/gate | GET /api/facts/public | GET /api/release/audit-logs
 POST /api/impact/rule/{id} | /api/impact/drawing-revision/{id} | /api/impact/install-event/{id}
 GET  /api/impact | GET /api/quality-events | POST /api/quality-events/{id}/close
+# 维修通知资格论证
+GET  /api/maintenance/notices | POST /api/maintenance/notices
+GET  /api/maintenance/notices/{id}/runs | POST /api/maintenance/notices/{id}/evaluate
+GET  /api/maintenance/runs/{id} | POST /api/maintenance/evaluate-adhoc
+GET  /api/maintenance/inventory-counts | /api/maintenance/assembly-links
 ```
+
+---
+
+## 五·补、维修通知资格论证（供应商维修通知 → 设备实际安装证据 → 通知资格）
+
+供应商发出维修通知时，**名单不能仅由“历史快照出现过某型号”决定**：服务负责人必须判断每台设备在目标时段是否
+具备足够的实际安装证据。本平台新增**维修通知资格论证器**，对一个供应商条件（供应商+目标型号）与目标时间窗，
+输出每台设备的资格四档与最小支持材料。
+
+### 资格四档 + 待核
+| 资格 | 判定依据 |
+| --- | --- |
+| **必然安装 CERTAIN** | 已证实安装（必要）区间与目标窗相交；装拆时点精确（装拆签字/出厂基线），窗内有闭合证据 |
+| **可能安装 POSSIBLE** | 仅盘点扩张出的可能区间与目标窗相交；装/拆时点无精确凭证，稀疏凭证留下较宽可能集（含缺少拆除单的开放端） |
+| **证据不足 INSUFFICIENT** | 目标时段没有任何与目标型号相关的在装/缺席凭证 |
+| **可排除 EXCLUDED** | 已证实缺席区间覆盖目标窗，或两次独立缺席盘点且从无在装主张 |
+| **矛盾待核 PENDING_REVIEW** | 在装主张与相反盘点/已证实缺席相互矛盾，平台不做资格裁定，只能待核 |
+
+### 两种方法都已落地，产出的是“通知资格”而非受影响快照
+1. **必要/可能时间区间求交**：把每件实物的出厂基线、装拆签字、盘点转成必要（NECESSARY）/可能（POSSIBLE）
+   安装区间与必要缺席区间，再与目标窗 `[start,end)` 求交。精确装拆给清晰边界；盘点只给两次盘点之间的区间，
+   稀疏凭证自然留下较宽可能集。
+2. **证据论证图**：维修单/装拆签字/盘点/出厂/总成层级统一为论证节点（`evidence_node`），节点间以
+   支持/矛盾/总成派生/界定边（`evidence_edge`）连接；一条设备归属结论必须有至少一条**独立支持路径**
+   （`evidence_support_path`），证据缺口可显式表达，论证规则可回放。
+
+### 三条关键纪律（已在代码固化）
+- **矛盾只能待核**：在装签字与“盘到空位”相反盘点冲突时判 `PENDING_REVIEW`，不猜倾向、不纳入必然名单，并登记质量事件。
+- **嵌套总成转装不复制内部件**：内部件无独立装拆凭证时，沿 `part_assembly_link` 从父总成派生安装断言（节点带
+  `assemblyDerived` 标记、以 `DERIVED_ASSEMBLY` 边连接），内部件随整树迁移，绝不会在两台设备被复制为两处。
+- **迟到凭证只产生补充名单**：评估支持 `asOfReceived` 认知边界，边界后接收的凭证不参与当时论证；再次评估只新增
+  一个 `notice_eligibility_run`，历史批次保留不改写。缺少拆除单时，开放结尾的安装主张降级为可能区间。
+
+### 四类验收样例（种子数据 + 启动重放，目标窗统一 2025-01-01 ~ 2025-07-01）
+| 场景 | 数据抓手 | 预期资格 |
+| --- | --- | --- |
+| **F 拆装时间缺口** | 冷却器 2024-11 拆、2025-03 装回（装回凭证 2025-05 才接收） | 认知边界批次 EQ0101=可排除；全量批次 EQ0101=必然安装；窗前已拆未复装设备保持可排除 |
+| **G 相反盘点 / 独立缺席盘点** | 液压件在装签字 vs 2025-02 盘到空位；另一位置两次独立缺席盘点 | 矛盾设备=待核；双缺席且无在装主张设备=可排除；窗内在装盘点设备=必然 |
+| **H 嵌套总成转装** | 齿轮箱总成（含两个轴承）2025-02 从 EQ0103 转装 EQ0106 | 父总成与内部轴承在两设备按区间正确定档；内部件证据为总成派生、节点不重复 |
+| **I 缺少拆除单** | 辅助驱动 2024-08 安装签字 + 一次在装盘点，无拆除单 | 开放端可能集覆盖目标窗 → 可能安装（`openEnd=true`），不夸大为必然 |
+
+页面核验：左侧菜单 **“维修通知资格”**，可对通知做全量/认知边界评估、查看四档设备集合、展开最小支持材料、
+独立支持路径与总成派生边；也可用“即时试算”不落库直接给供应商条件+时间窗。
 
 ---
 
@@ -166,15 +216,17 @@ GET  /api/impact | GET /api/quality-events | POST /api/quality-events/{id}/close
 以下为在本隔离环境**实际执行**并通过的验证（截至交付时）：
 
 1. `mvn -DskipTests package` 成功，产出 `backend/target/mdm-platform.jar`（Spring Boot 3.5.16 / JDK 25）。
-2. `npm run build` 成功，产出 `frontend/dist`（Vite + Vue3 生产包）。
-3. 后端连接本地 PostgreSQL 18 成功，自动建表、灌种子并重放五大场景：启动日志确认生成 **5 个配置快照、6 条兼容事实、5 条质量事件**，且
+2. `npm run build` 成功，产出 `frontend/dist`（Vite + Vue3 生产包，含“维修通知资格论证”页面）。
+3. 后端连接本地 PostgreSQL 18 成功，自动建表、灌种子并重放全部场景：启动日志确认生成 **5 个配置快照、6 条兼容事实、6 条质量事件**，以及维修通知 **5 条通知、6 个评估批次、54 条资格结论、28 个论证节点、21 条独立支持路径**，且
    - 场景 A 冲突冻结 + 发布闸门拦截成功；
    - 场景 B v1/v2 版本差异正确（v1 无冷却位证据、v2 纳入迟到凭证后出现冷却泵）；
    - 场景 E 伺服/电源 PASS、502 尺寸 FAIL；
-   - 场景 D 撤回后历史结论保留锁定版本并生成更正链。
-4. REST 冒烟通过：登录鉴权（错误密码 HTTP 401）、VIEWER 写操作返回 403、版本化时点查询、规则血缘、证据链 jsonb 原生输出、`facts-all`/`facts/public` 数据正确。
-5. 前端 `vite build` 编译无错误，10 个页面与路由、角色按钮禁用均已接线。
-6. 端到端断言脚本 `backend/verify_e2e.py`（仅依赖 Python 标准库，对运行中的服务做 21 项断言）全部通过，可重复执行：
+   - 场景 D 撤回后历史结论保留锁定版本并生成更正链；
+   - 维修通知场景 F/G/H/I 四档资格与矛盾待核定档正确（见“五·补”章）。
+4. REST 冒烟通过：登录鉴权（错误密码 HTTP 401）、VIEWER 写操作返回 403、版本化时点查询、规则血缘、证据链 jsonb 原生输出、`facts-all`/`facts/public`、维修通知评估/批次/即时试算数据正确。
+5. 前端 `vite build` 编译无错误，11 个页面与路由、角色按钮禁用均已接线。
+6. 单元测试：`InstallationIntervalEngineTest`（区间引擎四档定档，7 项）连同既有 `SnapshotServiceTest`/`DigestUtilTest` 共 12 项全部通过。
+7. 端到端断言脚本 `backend/verify_e2e.py`（仅依赖 Python 标准库，对运行中的服务做 **37 项**断言，含维修通知资格 16 项）全部通过，可重复执行：
    ```bash
    # 先启动后端，再运行
    python3 backend/verify_e2e.py

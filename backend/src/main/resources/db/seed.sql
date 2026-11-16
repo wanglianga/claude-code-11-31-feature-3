@@ -138,3 +138,118 @@ INSERT INTO rule_constraint (id, rule_id, constraint_type, attribute_name, expec
  (5,3,'POWER','voltage','380V','EQ','spec.voltage'),
  (6,3,'DIMENSION','dimension','2U','EQ','spec.dimension');
 SELECT setval('rule_constraint_id_seq', 10);
+
+-- =====================================================================
+-- 8. 维修通知资格论证四类验收场景
+--    场景 F 拆装时间缺口：精确装/拆签字 -> 必要区间边界清晰，缺口期不通知
+--    场景 G 相反盘点：在装签字与盘到空位相互矛盾 -> 只能待核；独立双缺席盘点 -> 可排除
+--    场景 H 嵌套总成转装：父总成转装，内部件按总成层级派生且不复制为两处
+--    场景 I 缺少拆除单：只有安装签字+一次在装盘点，开放端留下较宽可能集 -> 可能安装
+--    配套：迟到装拆凭证在二次评估时只产生补充名单，不改动首次评估
+-- 目标时间窗统一为 2025-01-01 ~ 2025-07-01（半开区间 [start,end)）
+-- =====================================================================
+
+-- 8.1 盘点接入契约
+INSERT INTO ingestion_contract (id, contract_code, contract_name, source_team, source_system, schema_version, effective_from, status, field_spec, trust_score, created_by) VALUES
+ (5,'CT-COUNT','盘点凭证接入契约','资产盘点组','EAM','v1','2024-01-01T00:00:00Z','VERIFIED',
+  '[{"field":"countCode","type":"string","required":true,"meaning":"盘点单号"},{"field":"observed","type":"enum","required":true,"meaning":"PRESENT/ABSENT"},{"field":"countTime","type":"datetime","required":true,"meaning":"盘点时点"}]',65,'admin');
+INSERT INTO ingestion_contract_version (contract_code, schema_version, source_team, source_ref, payload_digest, field_spec, trust_score) VALUES
+ ('CT-COUNT','v1','资产盘点组','eam/inventory/2024','sha256:count-v1','[]'::jsonb,65);
+
+-- 8.2 新增设备（101~106）
+INSERT INTO master_entity (id, entity_type, entity_code, display_name, spec_payload, status) VALUES
+ (110,'EQUIPMENT','EQ-CNC-2025-0101','五轴加工中心 0101','{"factorySerialNo":"SN-0101","model":"CNC-X5"}','VERIFIED'),
+ (111,'EQUIPMENT','EQ-CNC-2025-0102','五轴加工中心 0102','{"factorySerialNo":"SN-0102","model":"CNC-X5"}','VERIFIED'),
+ (112,'EQUIPMENT','EQ-CNC-2025-0103','五轴加工中心 0103','{"factorySerialNo":"SN-0103","model":"CNC-X5"}','VERIFIED'),
+ (113,'EQUIPMENT','EQ-CNC-2025-0104','五轴加工中心 0104','{"factorySerialNo":"SN-0104","model":"CNC-X5"}','VERIFIED'),
+ (114,'EQUIPMENT','EQ-CNC-2025-0105','五轴加工中心 0105','{"factorySerialNo":"SN-0105","model":"CNC-X5"}','VERIFIED'),
+ (115,'EQUIPMENT','EQ-CNC-2025-0106','五轴加工中心 0106','{"factorySerialNo":"SN-0106","model":"CNC-X6"}','VERIFIED');
+
+-- 8.3 新增装配位置（120~128）
+INSERT INTO master_entity (id, entity_type, entity_code, display_name, spec_payload, status) VALUES
+ (120,'MOUNT_POSITION','POS-SPINDLE-COOL','主轴冷却器位','{"slot":"E1"}','VERIFIED'),
+ (121,'MOUNT_POSITION','POS-HYDRAULIC','液压阀组位','{"slot":"F1"}','VERIFIED'),
+ (122,'MOUNT_POSITION','POS-GEARBOX','齿轮箱总成位','{"slot":"G1"}','VERIFIED'),
+ (123,'MOUNT_POSITION','POS-AUX-DRIVE','辅助驱动位','{"slot":"H1"}','VERIFIED'),
+ (124,'MOUNT_POSITION','POS-LUBE','润滑泵位','{"slot":"F2"}','VERIFIED'),
+ (125,'MOUNT_POSITION','POS-COOLER-B','备用冷却器位','{"slot":"E2"}','VERIFIED'),
+ (126,'MOUNT_POSITION','POS-COOLER-C','冷却器旁路位','{"slot":"E3"}','VERIFIED'),
+ (127,'MOUNT_POSITION','POS-GEARBOX-B','二号机齿轮箱位','{"slot":"G2"}','VERIFIED'),
+ (128,'MOUNT_POSITION','POS-HYDRO-B','二号液压位','{"slot":"F3"}','VERIFIED');
+
+-- 8.4 新增部件型号（130~134）
+INSERT INTO master_entity (id, entity_type, entity_code, display_name, supplier_code, spec_payload, status) VALUES
+ (130,'PART_MODEL','PM-COOLER-300','主轴冷却器 300','SUP-SIEMENS','{"voltage":"380V","cooling":"8kW","dimension":"4U"}','VERIFIED'),
+ (131,'PART_MODEL','PM-HYDRO-400','液压阀组 400','SUP-DELTA','{"pressure":"21MPa","protocol":"CANopen"}','VERIFIED'),
+ (132,'PART_MODEL','PM-GEAR-500','精密齿轮箱总成 500','SUP-SANYO','{"ratio":"1:10","lubrication":"oil-bath"}','VERIFIED'),
+ (133,'PART_MODEL','PM-BEARING-600','总成内轴承 600','SUP-SANYO','{"precision":"P4","bore":"80mm"}','VERIFIED'),
+ (134,'PART_MODEL','PM-AUXDRIVE-700','辅助驱动器 700','SUP-DELTA','{"voltage":"220V","protocol":"CANopen","dimension":"2U"}','VERIFIED');
+
+-- 8.5 新增实物（140~151）
+INSERT INTO master_entity (id, entity_type, entity_code, display_name, supplier_code, spec_payload, status) VALUES
+ (140,'PHYSICAL_PART','PP-COOLER-0101','冷却器实物 0101','SUP-SIEMENS','{"modelCode":"PM-COOLER-300"}','VERIFIED'),
+ (141,'PHYSICAL_PART','PP-HYDRO-0102','液压阀组实物 0102','SUP-DELTA','{"modelCode":"PM-HYDRO-400"}','VERIFIED'),
+ (142,'PHYSICAL_PART','PP-GEAR-0103','齿轮箱总成实物 0103','SUP-SANYO','{"modelCode":"PM-GEAR-500"}','VERIFIED'),
+ (143,'PHYSICAL_PART','PP-BEAR-0001','轴承实物 0001（齿轮箱内部件）','SUP-SANYO','{"modelCode":"PM-BEARING-600"}','VERIFIED'),
+ (144,'PHYSICAL_PART','PP-BEAR-0002','轴承实物 0002（齿轮箱内部件）','SUP-SANYO','{"modelCode":"PM-BEARING-600"}','VERIFIED'),
+ (145,'PHYSICAL_PART','PP-AUX-0104','辅助驱动实物 0104','SUP-DELTA','{"modelCode":"PM-AUXDRIVE-700"}','VERIFIED'),
+ (147,'PHYSICAL_PART','PP-HYDRO-0202','液压阀组实物 0202','SUP-DELTA','{"modelCode":"PM-HYDRO-400"}','VERIFIED'),
+ (149,'PHYSICAL_PART','PP-HYDRO-0306','液压阀组实物 0306','SUP-DELTA','{"modelCode":"PM-HYDRO-400"}','VERIFIED'),
+ (150,'PHYSICAL_PART','PP-COOLER-0105','冷却器实物 0105','SUP-SIEMENS','{"modelCode":"PM-COOLER-300"}','VERIFIED'),
+ (151,'PHYSICAL_PART','PP-COOLER-0106','冷却器实物 0106','SUP-SIEMENS','{"modelCode":"PM-COOLER-300"}','VERIFIED');
+SELECT setval('master_entity_id_seq', 200);
+
+-- 8.6 总成层级：齿轮箱 142 嵌套轴承 143/144（转装时整树迁移，内部件不单独产生装拆凭证）
+INSERT INTO part_assembly_link (parent_physical_id, child_physical_id, link_type, effective_from, source_ref) VALUES
+ (142,143,'CONTAINS','2024-02-01T00:00:00Z','ASM-LINK-GEAR-1'),
+ (142,144,'CONTAINS','2024-02-01T00:00:00Z','ASM-LINK-GEAR-2');
+
+-- 8.7 出厂基线
+INSERT INTO factory_record (equipment_id, mount_position_id, part_model_id, physical_part_id, factory_time, source_contract_id, source_ref, payload_digest, trust_score) VALUES
+ (110,120,130,140,'2024-01-10T08:00:00Z',3,'FAC-EQ0101.pdf','sha256:fac0101',85),
+ (112,122,132,142,'2024-02-01T08:00:00Z',3,'FAC-EQ0103.pdf','sha256:fac0103',85),
+ (111,121,131,141,'2024-03-01T08:00:00Z',3,'FAC-EQ0102.pdf','sha256:fac0102',85);
+
+-- 8.8 拆装凭证（只追加）
+-- 场景 F：EQ0101 冷却器 2024-11 拆下、2025-03 装回；装回凭证迟到（2025-05 才接收）
+INSERT INTO install_event (event_code, equipment_id, mount_position_id, physical_part_id, part_model_id, event_type, event_time, received_at, source_contract_id, source_ref, payload_digest, trust_score, adjudication) VALUES
+ ('EV-REM-101',110,120,140,130,'REMOVE','2024-11-20T14:00:00Z','2024-11-20T18:00:00Z',3,'VCH-2024-1120-1','sha256:evrem101',78,'NORMAL'),
+ ('EV-INST-101',110,120,140,130,'INSTALL','2025-03-15T10:00:00Z','2025-05-01T09:00:00Z',3,'VCH-LATE-20250315','sha256:evinst101-late',70,'NORMAL'),
+-- 场景 G：EQ0102 液压阀组 2024-09 签字安装（无拆除单），与 2025-02 盘到空位相反
+ ('EV-INST-102',111,121,141,131,'INSTALL','2024-09-01T09:00:00Z','2024-09-01T12:00:00Z',3,'VCH-2024-0901-1','sha256:evinst102',75,'NORMAL'),
+-- 场景 H：齿轮箱总成 2025-02 从 EQ0103 转装到 EQ0106（凭证只开在父总成 142 上，内部件不复制）
+ ('EV-REM-103',112,122,142,132,'REMOVE','2025-02-10T13:00:00Z','2025-02-10T17:00:00Z',3,'VCH-2025-0210-1','sha256:evrem103',80,'NORMAL'),
+ ('EV-INST-103',115,127,142,132,'INSTALL','2025-02-12T10:00:00Z','2025-02-12T14:00:00Z',3,'VCH-2025-0212-1','sha256:evinst103',80,'NORMAL'),
+-- 场景 I：EQ0104 辅助驱动 2024-08 签字安装，之后无拆除单
+ ('EV-INST-104',113,123,145,134,'INSTALL','2024-08-01T09:30:00Z','2024-08-01T12:00:00Z',3,'VCH-2024-0801-1','sha256:evinst104',75,'NORMAL'),
+-- 对照：EQ0106 备用冷却器 2024-06 装、2024-10 拆（目标窗前已结束 -> 可排除）
+ ('EV-INST-106',115,125,151,130,'INSTALL','2024-06-01T09:00:00Z','2024-06-01T12:00:00Z',3,'VCH-2024-0601-1','sha256:evinst106',75,'NORMAL'),
+ ('EV-REM-106',115,125,151,130,'REMOVE','2024-10-01T15:00:00Z','2024-10-01T18:00:00Z',3,'VCH-2024-1001-1','sha256:evrem106',75,'NORMAL'),
+-- 对照：EQ0106 液压位 2024-10 装，2025-03 盘点在装（窗内必然）
+ ('EV-INST-107',115,128,149,131,'INSTALL','2024-10-05T09:00:00Z','2024-10-05T12:00:00Z',3,'VCH-2024-1005-1','sha256:evinst107',75,'NORMAL');
+
+-- 8.9 盘点凭证（区间证据；PRESENT/ABSENT）
+INSERT INTO inventory_count (count_code, equipment_id, mount_position_id, physical_part_id, part_model_id, observed, count_time, received_at, source_contract_id, source_ref, payload_digest, trust_score, note) VALUES
+-- 场景 I：一次在装盘点，之后再无凭证 -> 开放端可能集覆盖目标窗
+ ('IC-2024-1210',113,123,145,134,'PRESENT','2024-12-10T10:00:00Z','2024-12-11T10:00:00Z',5,'EAM-COUNT-20241210','sha256:ic1210',68,'年度盘点在装'),
+-- 场景 G：相反盘点（盘到空位），与在装签字矛盾
+ ('IC-2025-0220',111,121,141,131,'ABSENT','2025-02-20T10:00:00Z','2025-02-21T10:00:00Z',5,'EAM-COUNT-20250220','sha256:ic0220',70,'盘点时该位为空，未见到拆除单'),
+-- 场景 G 对照：EQ0104 润滑位两次独立盘点均缺席，且从无安装凭证 -> 可排除（独立支持路径）
+ ('IC-2025-0120',113,124,147,131,'ABSENT','2025-01-20T10:00:00Z','2025-01-21T10:00:00Z',5,'EAM-COUNT-20250120','sha256:ic0120',68,'第一次盘点缺席'),
+ ('IC-2025-0320',113,124,147,131,'ABSENT','2025-03-20T10:00:00Z','2025-03-21T10:00:00Z',5,'EAM-COUNT-20250320','sha256:ic0320',68,'第二次盘点缺席，独立支持排除'),
+-- 场景 H 对照：EQ0106 液压位窗内在装盘点
+ ('IC-2025-0305',115,128,149,131,'PRESENT','2025-03-05T10:00:00Z','2025-03-06T10:00:00Z',5,'EAM-COUNT-20250305','sha256:ic0305',70,'窗内盘点在装'),
+-- 场景 H：齿轮箱转装到 EQ0106 后的在装盘点（闭合必要区间；内部轴承经总成派生同样闭合）
+ ('IC-2025-0401',115,127,142,132,'PRESENT','2025-04-01T10:00:00Z','2025-04-02T10:00:00Z',5,'EAM-COUNT-20250401','sha256:ic0401',70,'转装后齿轮箱在装盘点'),
+-- 稀疏凭证：EQ0105 仅一次在装盘点、无任何装拆签字 -> 纯可能安装
+ ('IC-2024-1215',114,126,150,130,'PRESENT','2024-12-15T10:00:00Z','2024-12-16T10:00:00Z',5,'EAM-COUNT-20241215','sha256:ic1215',66,'仅一次盘点，装拆时点未知'),
+-- 场景 F：EQ0101 迟到装回凭证之后的在装盘点，闭合出窗内必要安装区间（边界清晰）
+ ('IC-2025-0410',110,120,140,130,'PRESENT','2025-04-10T10:00:00Z','2025-04-11T10:00:00Z',5,'EAM-COUNT-20250410','sha256:ic0410',70,'装回后在装盘点，其后无拆除单');
+
+-- 8.10 供应商维修通知（供应商条件 + 目标时间窗）
+INSERT INTO maintenance_notice (notice_code, title, supplier_id, target_model_id, window_start, window_end, notice_status, source_ref, payload_digest, created_by) VALUES
+ ('NTC-2025-001','冷却器 300 密封件维修通知',1,130,'2025-01-01T00:00:00Z','2025-07-01T00:00:00Z','OPEN','SUP-NOTICE-2025-001.pdf','sha256:ntc001','admin'),
+ ('NTC-2025-002','液压阀组 400 阀体内漏维修通知',2,131,'2025-01-01T00:00:00Z','2025-07-01T00:00:00Z','OPEN','SUP-NOTICE-2025-002.pdf','sha256:ntc002','admin'),
+ ('NTC-2025-003','齿轮箱总成 500 齿面探伤维修通知',3,132,'2025-01-01T00:00:00Z','2025-07-01T00:00:00Z','OPEN','SUP-NOTICE-2025-003.pdf','sha256:ntc003','admin'),
+ ('NTC-2025-004','总成内轴承 600 保持架维修通知',3,133,'2025-01-01T00:00:00Z','2025-07-01T00:00:00Z','OPEN','SUP-NOTICE-2025-004.pdf','sha256:ntc004','admin'),
+ ('NTC-2025-005','辅助驱动器 700 电容批次维修通知',2,134,'2025-01-01T00:00:00Z','2025-07-01T00:00:00Z','OPEN','SUP-NOTICE-2025-005.pdf','sha256:ntc005','admin');
